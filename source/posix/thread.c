@@ -165,8 +165,9 @@ static void *thread_fn(void *arg) {
          * and makes sure the numa node of the cpu we launched this thread on is where memory gets allocated. However,
          * we don't want to fail the application if this fails, so make the call, and ignore the result. */
         long resp = g_set_mempolicy_ptr(AWS_MPOL_PREFERRED_ALIAS, NULL, 0);
+        int errno_value = errno; /* Always cache errno before potential side-effect */
         if (resp) {
-            AWS_LOGF_WARN(AWS_LS_COMMON_THREAD, "call to set_mempolicy() failed with errno %d", errno);
+            AWS_LOGF_WARN(AWS_LS_COMMON_THREAD, "call to set_mempolicy() failed with errno %d", errno_value);
         }
     }
     wrapper.func(wrapper.arg);
@@ -274,7 +275,7 @@ int aws_thread_launch(
 
 /* AFAIK you can't set thread affinity on apple platforms, and it doesn't really matter since all memory
  * NUMA or not is setup in interleave mode.
- * Thread afinity is also not supported on Android systems, and honestly, if you're running android on a NUMA
+ * Thread affinity is also not supported on Android systems, and honestly, if you're running android on a NUMA
  * configuration, you've got bigger problems. */
 #if AWS_AFFINITY_METHOD == AWS_AFFINITY_METHOD_PTHREAD_ATTR
         if (options->cpu_id >= 0) {
