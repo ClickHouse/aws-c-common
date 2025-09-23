@@ -21,10 +21,16 @@ size_t aws_system_info_processor_count(void) {
     return info.dwNumberOfProcessors;
 }
 
+size_t aws_system_info_page_size(void) {
+    SYSTEM_INFO info;
+    GetSystemInfo(&info);
+    return info.dwPageSize;
+}
+
 /* the next three functions need actual implementations before we can have proper numa alignment on windows.
  * For now leave them stubbed out. */
 uint16_t aws_get_cpu_group_count(void) {
-    return 1u;
+    return 1U;
 }
 
 size_t aws_get_cpu_count_for_group(uint16_t group_idx) {
@@ -295,7 +301,8 @@ void aws_backtrace_print(FILE *fp, void *call_site_data) {
         AWS_LS_COMMON_GENERAL, "aws_backtrace_print: backtrace requested, but logging is unsupported on this platform");
 }
 
-void aws_backtrace_log() {
+void aws_backtrace_log(int log_level) {
+    (void)log_level;
     AWS_LOGF_TRACE(
         AWS_LS_COMMON_GENERAL, "aws_backtrace_log: backtrace requested, but logging is unsupported on this platform");
 }

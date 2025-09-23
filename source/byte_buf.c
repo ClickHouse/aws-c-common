@@ -816,6 +816,25 @@ int aws_byte_buf_reserve_relative(struct aws_byte_buf *buffer, size_t additional
     return aws_byte_buf_reserve(buffer, requested_capacity);
 }
 
+int aws_byte_buf_reserve_smart(struct aws_byte_buf *buffer, size_t requested_capacity) {
+
+    if (requested_capacity <= buffer->capacity) {
+        AWS_POSTCONDITION(aws_byte_buf_is_valid(buffer));
+        return AWS_OP_SUCCESS;
+    }
+    size_t double_current_capacity = aws_add_size_saturating(buffer->capacity, buffer->capacity);
+    size_t new_capacity = aws_max_size(requested_capacity, double_current_capacity);
+    return aws_byte_buf_reserve(buffer, new_capacity);
+}
+
+int aws_byte_buf_reserve_smart_relative(struct aws_byte_buf *buffer, size_t additional_length) {
+    size_t requested_capacity = 0;
+    if (AWS_UNLIKELY(aws_add_size_checked(buffer->len, additional_length, &requested_capacity))) {
+        return AWS_OP_ERR;
+    }
+    return aws_byte_buf_reserve_smart(buffer, requested_capacity);
+}
+
 struct aws_byte_cursor aws_byte_cursor_right_trim_pred(
     const struct aws_byte_cursor *source,
     aws_byte_predicate_fn *predicate) {
@@ -1631,7 +1650,7 @@ int aws_byte_buf_append_and_update(struct aws_byte_buf *to, struct aws_byte_curs
         return AWS_OP_ERR;
     }
 
-    from_and_update->ptr = to->buffer + (to->len - from_and_update->len);
+    from_and_update->ptr = to->buffer == NULL ? NULL : to->buffer + (to->len - from_and_update->len);
     return AWS_OP_SUCCESS;
 }
 

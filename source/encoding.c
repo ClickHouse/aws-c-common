@@ -23,7 +23,7 @@ static inline size_t aws_common_private_base64_decode_sse41(const unsigned char 
     (void)out;
     (void)len;
     AWS_ASSERT(false);
-    return (size_t)-1; /* unreachable */
+    return SIZE_MAX; /* unreachable */
 }
 static inline void aws_common_private_base64_encode_sse41(const unsigned char *in, unsigned char *out, size_t len) {
     (void)in;
@@ -66,7 +66,9 @@ static const uint8_t BASE64_DECODING_TABLE[256] = {
 int aws_hex_compute_encoded_len(size_t to_encode_len, size_t *encoded_length) {
     AWS_ASSERT(encoded_length);
 
-    size_t temp = (to_encode_len << 1) + 1;
+    /* For every byte of input, there will be 2 hex chars of encoded output */
+
+    size_t temp = to_encode_len << 1;
 
     if (AWS_UNLIKELY(temp < to_encode_len)) {
         return aws_raise_error(AWS_ERROR_OVERFLOW_DETECTED);
@@ -98,7 +100,7 @@ int aws_hex_encode(const struct aws_byte_cursor *AWS_RESTRICT to_encode, struct 
         output->buffer[written++] = HEX_CHARS[to_encode->ptr[i] & 0x0f];
     }
 
-    output->buffer[written] = '\0';
+    AWS_ASSERT(written == encoded_len);
     output->len = encoded_len;
 
     return AWS_OP_SUCCESS;
@@ -153,6 +155,10 @@ static int s_hex_decode_char_to_int(char character, uint8_t *int_val) {
 int aws_hex_compute_decoded_len(size_t to_decode_len, size_t *decoded_len) {
     AWS_ASSERT(decoded_len);
 
+    /* For every 2 hex chars (rounded up) of encoded input, there will be 1 byte of decoded output.
+     * Rounding is because if buffer isn't even, we'll pretend there's an extra '0' at start of buffer */
+
+    /* adding 1 before dividing by 2 is a trick to round up during division */
     size_t temp = (to_decode_len + 1);
 
     if (AWS_UNLIKELY(temp < to_decode_len)) {
@@ -185,7 +191,7 @@ int aws_hex_decode(const struct aws_byte_cursor *AWS_RESTRICT to_decode, struct 
     /* if the buffer isn't even, prepend a 0 to the buffer. */
     if (AWS_UNLIKELY(to_decode->len & 0x01)) {
         i = 1;
-        if (s_hex_decode_char_to_int(to_decode->ptr[0], &low_value)) {
+        if (s_hex_decode_char_to_int((char)to_decode->ptr[0], &low_value)) {
             return aws_raise_error(AWS_ERROR_INVALID_HEX_STR);
         }
 
@@ -212,6 +218,10 @@ int aws_hex_decode(const struct aws_byte_cursor *AWS_RESTRICT to_decode, struct 
 int aws_base64_compute_encoded_len(size_t to_encode_len, size_t *encoded_len) {
     AWS_ASSERT(encoded_len);
 
+    /* For every 3 bytes (rounded up) of unencoded input, there will be 4 ascii characters of encoded output.
+     * Rounding is because the output will be padded with '=' chars if necessary to make it divisible by 4. */
+
+    /* adding 2 before dividing by 3 is a trick to round up during division */
     size_t tmp = to_encode_len + 2;
 
     if (AWS_UNLIKELY(tmp < to_encode_len)) {
@@ -220,7 +230,7 @@ int aws_base64_compute_encoded_len(size_t to_encode_len, size_t *encoded_len) {
 
     tmp /= 3;
     size_t overflow_check = tmp;
-    tmp = 4 * tmp + 1; /* plus one for the NULL terminator */
+    tmp = 4 * tmp;
 
     if (AWS_UNLIKELY(tmp < overflow_check)) {
         return aws_raise_error(AWS_ERROR_OVERFLOW_DETECTED);
@@ -243,40 +253,40 @@ int aws_base64_compute_decoded_len(const struct aws_byte_cursor *AWS_RESTRICT to
         return AWS_OP_SUCCESS;
     }
 
+    /* ensure it's divisible by 4 */
     if (AWS_UNLIKELY(len & 0x03)) {
         return aws_raise_error(AWS_ERROR_INVALID_BASE64_STR);
     }
 
-    size_t tmp = len * 3;
+    /* For every 4 ascii characters of encoded input, there will be 3 bytes of decoded output (deal with padding later)
+     * decoded_len = 3/4 * len       <-- note that result will be smaller then len, so overflow can be avoided
+     *             = (len / 4) * 3   <-- divide before multiply to avoid overflow
+     */
+    size_t decoded_len_tmp = (len / 4) * 3;
 
-    if (AWS_UNLIKELY(tmp < len)) {
-        return aws_raise_error(AWS_ERROR_OVERFLOW_DETECTED);
-    }
-
+    /* But last two ascii chars might be padding. */
+    AWS_ASSERT(len >= 4); /* we checked earlier len != 0, and was divisible by 4 */
     size_t padding = 0;
-
-    if (len >= 2 && input[len - 1] == '=' && input[len - 2] == '=') { /*last two chars are = */
+    if (input[len - 1] == '=' && input[len - 2] == '=') { /*last two chars are = */
         padding = 2;
     } else if (input[len - 1] == '=') { /*last char is = */
         padding = 1;
     }
 
-    *decoded_len = (tmp / 4 - padding);
+    *decoded_len = decoded_len_tmp - padding;
     return AWS_OP_SUCCESS;
 }
 
 int aws_base64_encode(const struct aws_byte_cursor *AWS_RESTRICT to_encode, struct aws_byte_buf *AWS_RESTRICT output) {
-    AWS_ASSERT(to_encode->ptr);
-    AWS_ASSERT(output->buffer);
+    AWS_ASSERT(to_encode->len == 0 || to_encode->ptr != NULL);
 
-    size_t terminated_length = 0;
     size_t encoded_length = 0;
-    if (AWS_UNLIKELY(aws_base64_compute_encoded_len(to_encode->len, &terminated_length))) {
+    if (AWS_UNLIKELY(aws_base64_compute_encoded_len(to_encode->len, &encoded_length))) {
         return AWS_OP_ERR;
     }
 
     size_t needed_capacity = 0;
-    if (AWS_UNLIKELY(aws_add_size_checked(output->len, terminated_length, &needed_capacity))) {
+    if (AWS_UNLIKELY(aws_add_size_checked(output->len, encoded_length, &needed_capacity))) {
         return AWS_OP_ERR;
     }
 
@@ -284,16 +294,10 @@ int aws_base64_encode(const struct aws_byte_cursor *AWS_RESTRICT to_encode, stru
         return aws_raise_error(AWS_ERROR_SHORT_BUFFER);
     }
 
-    /*
-     * For convenience to standard C functions expecting a null-terminated
-     * string, the output is terminated. As the encoding itself can be used in
-     * various ways, however, its length should never account for that byte.
-     */
-    encoded_length = (terminated_length - 1);
+    AWS_ASSERT(needed_capacity == 0 || output->buffer != NULL);
 
     if (aws_common_private_has_avx2()) {
         aws_common_private_base64_encode_sse41(to_encode->ptr, output->buffer + output->len, to_encode->len);
-        output->buffer[output->len + encoded_length] = 0;
         output->len += encoded_length;
         return AWS_OP_SUCCESS;
     }
@@ -329,9 +333,6 @@ int aws_base64_encode(const struct aws_byte_cursor *AWS_RESTRICT to_encode, stru
         }
     }
 
-    /* it's a string add the null terminator. */
-    output->buffer[output->len + encoded_length] = 0;
-
     output->len += encoded_length;
 
     return AWS_OP_SUCCESS;
@@ -361,7 +362,7 @@ int aws_base64_decode(const struct aws_byte_cursor *AWS_RESTRICT to_decode, stru
 
     if (aws_common_private_has_avx2()) {
         size_t result = aws_common_private_base64_decode_sse41(to_decode->ptr, output->buffer, to_decode->len);
-        if (result == -1) {
+        if (result == SIZE_MAX) {
             return aws_raise_error(AWS_ERROR_INVALID_BASE64_STR);
         }
 
@@ -412,7 +413,7 @@ int aws_base64_decode(const struct aws_byte_cursor *AWS_RESTRICT to_decode, stru
     return AWS_OP_SUCCESS;
 }
 
-struct aws_utf8_validator {
+struct aws_utf8_decoder {
     struct aws_allocator *alloc;
     /* Value of current codepoint, updated as we read each byte */
     uint32_t codepoint;
@@ -421,54 +422,66 @@ struct aws_utf8_validator {
     uint32_t min;
     /* Number of bytes remaining the current codepoint */
     uint8_t remaining;
+    /* Custom callback */
+    int (*on_codepoint)(uint32_t codepoint, void *user_data);
+    /* user_data for on_codepoint */
+    void *user_data;
 };
 
-struct aws_utf8_validator *aws_utf8_validator_new(struct aws_allocator *allocator) {
-    struct aws_utf8_validator *validator = aws_mem_calloc(allocator, 1, sizeof(struct aws_utf8_validator));
-    validator->alloc = allocator;
-    return validator;
+struct aws_utf8_decoder *aws_utf8_decoder_new(
+    struct aws_allocator *allocator,
+    const struct aws_utf8_decoder_options *options) {
+
+    struct aws_utf8_decoder *decoder = aws_mem_calloc(allocator, 1, sizeof(struct aws_utf8_decoder));
+    decoder->alloc = allocator;
+    if (options) {
+        decoder->on_codepoint = options->on_codepoint;
+        decoder->user_data = options->user_data;
+    }
+    return decoder;
 }
 
-void aws_utf8_validator_destroy(struct aws_utf8_validator *validator) {
-    if (validator) {
-        aws_mem_release(validator->alloc, validator);
+void aws_utf8_decoder_destroy(struct aws_utf8_decoder *decoder) {
+    if (decoder) {
+        aws_mem_release(decoder->alloc, decoder);
     }
 }
 
-void aws_utf8_validator_reset(struct aws_utf8_validator *validator) {
-    validator->codepoint = 0;
-    validator->min = 0;
-    validator->remaining = 0;
+void aws_utf8_decoder_reset(struct aws_utf8_decoder *decoder) {
+    decoder->codepoint = 0;
+    decoder->min = 0;
+    decoder->remaining = 0;
 }
 
 /* Why yes, this could be optimized. */
-int aws_utf8_validator_update(struct aws_utf8_validator *validator, struct aws_byte_cursor bytes) {
+int aws_utf8_decoder_update(struct aws_utf8_decoder *decoder, struct aws_byte_cursor bytes) {
+
     /* We're respecting RFC-3629, which uses 1 to 4 byte sequences (never 5 or 6) */
     for (size_t i = 0; i < bytes.len; ++i) {
         uint8_t byte = bytes.ptr[i];
 
-        if (validator->remaining == 0) {
+        if (decoder->remaining == 0) {
             /* Check first byte of the codepoint to determine how many more bytes remain */
             if ((byte & 0x80) == 0x00) {
                 /* 1 byte codepoints start with 0xxxxxxx */
-                validator->remaining = 0;
-                validator->codepoint = byte;
-                validator->min = 0;
+                decoder->remaining = 0;
+                decoder->codepoint = byte;
+                decoder->min = 0;
             } else if ((byte & 0xE0) == 0xC0) {
                 /* 2 byte codepoints start with 110xxxxx */
-                validator->remaining = 1;
-                validator->codepoint = byte & 0x1F;
-                validator->min = 0x80;
+                decoder->remaining = 1;
+                decoder->codepoint = byte & 0x1F;
+                decoder->min = 0x80;
             } else if ((byte & 0xF0) == 0xE0) {
                 /* 3 byte codepoints start with 1110xxxx */
-                validator->remaining = 2;
-                validator->codepoint = byte & 0x0F;
-                validator->min = 0x800;
+                decoder->remaining = 2;
+                decoder->codepoint = byte & 0x0F;
+                decoder->min = 0x800;
             } else if ((byte & 0xF8) == 0xF0) {
                 /* 4 byte codepoints start with 11110xxx */
-                validator->remaining = 3;
-                validator->codepoint = byte & 0x07;
-                validator->min = 0x10000;
+                decoder->remaining = 3;
+                decoder->codepoint = byte & 0x07;
+                decoder->min = 0x10000;
             } else {
                 return aws_raise_error(AWS_ERROR_INVALID_UTF8);
             }
@@ -481,22 +494,29 @@ int aws_utf8_validator_update(struct aws_utf8_validator *validator, struct aws_b
 
             /* Insert the 6 newly decoded bits:
              * shifting left anything we've already decoded, and insert the new bits to the right */
-            validator->codepoint = (validator->codepoint << 6) | (byte & 0x3F);
+            decoder->codepoint = (decoder->codepoint << 6) | (byte & 0x3F);
 
             /* If we've decoded the whole codepoint, check it for validity
              * (don't need to do these particular checks on 1 byte codepoints) */
-            if (--validator->remaining == 0) {
+            if (--decoder->remaining == 0) {
                 /* Check that it's not "overlong" (encoded using more bytes than necessary) */
-                if (validator->codepoint < validator->min) {
+                if (decoder->codepoint < decoder->min) {
                     return aws_raise_error(AWS_ERROR_INVALID_UTF8);
                 }
 
                 /* UTF-8 prohibits encoding character numbers between U+D800 and U+DFFF,
                  * which are reserved for use with the UTF-16 encoding form (as
                  * surrogate pairs) and do not directly represent characters */
-                if (validator->codepoint >= 0xD800 && validator->codepoint <= 0xDFFF) {
+                if (decoder->codepoint >= 0xD800 && decoder->codepoint <= 0xDFFF) {
                     return aws_raise_error(AWS_ERROR_INVALID_UTF8);
                 }
+            }
+        }
+
+        /* Invoke user's on_codepoint callback */
+        if (decoder->on_codepoint && decoder->remaining == 0) {
+            if (decoder->on_codepoint(decoder->codepoint, decoder->user_data)) {
+                return AWS_OP_ERR;
             }
         }
     }
@@ -504,22 +524,28 @@ int aws_utf8_validator_update(struct aws_utf8_validator *validator, struct aws_b
     return AWS_OP_SUCCESS;
 }
 
-int aws_utf8_validator_finalize(struct aws_utf8_validator *validator) {
-    bool valid = validator->remaining == 0;
-    aws_utf8_validator_reset(validator);
+int aws_utf8_decoder_finalize(struct aws_utf8_decoder *decoder) {
+    bool valid = decoder->remaining == 0;
+    aws_utf8_decoder_reset(decoder);
     if (AWS_LIKELY(valid)) {
         return AWS_OP_SUCCESS;
     }
     return aws_raise_error(AWS_ERROR_INVALID_UTF8);
 }
 
-bool aws_text_is_valid_utf8(struct aws_byte_cursor bytes) {
-    struct aws_utf8_validator validator = {.remaining = 0};
-    if (aws_utf8_validator_update(&validator, bytes)) {
-        return false;
+int aws_decode_utf8(struct aws_byte_cursor bytes, const struct aws_utf8_decoder_options *options) {
+    struct aws_utf8_decoder decoder = {
+        .on_codepoint = options ? options->on_codepoint : NULL,
+        .user_data = options ? options->user_data : NULL,
+    };
+
+    if (aws_utf8_decoder_update(&decoder, bytes)) {
+        return AWS_OP_ERR;
     }
-    if (validator.remaining != 0) {
-        return false;
+
+    if (aws_utf8_decoder_finalize(&decoder)) {
+        return AWS_OP_ERR;
     }
-    return true;
+
+    return AWS_OP_SUCCESS;
 }

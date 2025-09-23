@@ -9,6 +9,8 @@
 #include <aws/common/platform.h>
 #include <stdio.h>
 
+AWS_PUSH_SANE_WARNING_LEVEL
+
 #ifdef AWS_OS_WINDOWS
 #    define AWS_PATH_DELIM '\\'
 #    define AWS_PATH_DELIM_STR "\\"
@@ -163,6 +165,13 @@ AWS_COMMON_API
 char aws_get_platform_directory_separator(void);
 
 /**
+ * Normalizes the path by replacing any directory separator with the local platform's directory separator.
+ * @param path path to normalize. Must be writeable.
+ */
+AWS_COMMON_API
+void aws_normalize_directory_separator(struct aws_byte_buf *path);
+
+/**
  * Returns the current user's home directory.
  */
 AWS_COMMON_API
@@ -182,6 +191,8 @@ bool aws_path_exists(const struct aws_string *path);
  *   fseeko() on linux
  *
  * whence can either be SEEK_SET or SEEK_END
+ *
+ * Returns AWS_OP_SUCCESS, or AWS_OP_ERR (after an error has been raised).
  */
 AWS_COMMON_API
 int aws_fseek(FILE *file, int64_t offset, int whence);
@@ -196,6 +207,66 @@ int aws_fseek(FILE *file, int64_t offset, int whence);
 AWS_COMMON_API
 int aws_file_get_length(FILE *file, int64_t *length);
 
-AWS_EXTERN_C_END
+/*
+ * Read from the file using the file path with DIRECT I/O, starting at offset to fill the output_buf or to the
+ * max_read_length.
+ * Using direct IO to bypass the OS cache. Helpful when the disk I/O outperform the kernel cache.
+ * If O_DIRECT is not supported, returns AWS_ERROR_UNSUPPORTED_OPERATION.
+ * Notes:
+ * - ONLY supports linux for now and raise AWS_ERROR_UNSUPPORTED_OPERATION on all other platforms (eg: FreeBSD).
+ * - check the NOTES for O_DIRECT in https://man7.org/linux/man-pages/man2/openat.2.html
+ * - The offset, length and output_buf->buffer all need to be aligned with the page size. Otherwise,
+ *  AWS_ERROR_INVALID_ARGUMENT will be raised.
+ *
+ * @param file_path         The file path to read from.
+ * @param offset            The offset in the file to start reading from.
+ * @param max_read_length   The maximum number of bytes to read.
+ * @param output_buf        The buffer read to.
+ * @param out_actual_read   The actual number of bytes read.
+ *
+ * Returns AWS_OP_SUCCESS, or AWS_OP_ERR (after an error has been raised).
+ */
+AWS_COMMON_API
+int aws_file_path_read_from_offset_direct_io(
+    const struct aws_string *file_path,
+    uint64_t offset,
+    size_t max_read_length,
+    struct aws_byte_buf *output_buf,
+    size_t *out_actual_read);
+
+/*
+ * Read from the file using the file path, starting at offset to fill the output_buf or to the
+ * max_read_length.
+ *
+ * @param file_path         The file path to read from.
+ * @param offset            The offset in the file to start reading from.
+ * @param max_read_length   The maximum number of bytes to read.
+ * @param output_buf        The buffer read to.
+ * @param out_actual_read   The actual number of bytes read.
+ *
+ * Returns AWS_OP_SUCCESS, or AWS_OP_ERR (after an error has been raised).
+ */
+AWS_COMMON_API
+int aws_file_path_read_from_offset(
+    const struct aws_string *file_path,
+    uint64_t offset,
+    size_t max_read_length,
+    struct aws_byte_buf *output_buf,
+    size_t *out_actual_read);
+
+/*
+ * The function serve the same purpose as `aws_file_path_read_from_offset_direct_io`.
+ * Please use `aws_file_path_read_from_offset_direct_io` directly.
+ */
+AWS_COMMON_API
+int aws_file_path_read_from_offset_direct_io_with_chunk_size(
+    const struct aws_string *file_path,
+    uint64_t offset,
+    size_t max_read_length,
+    size_t max_chunk_size,
+    struct aws_byte_buf *output_buf,
+    size_t *out_actual_read);
+
+AWS_EXTERN_C_END AWS_POP_SANE_WARNING_LEVEL
 
 #endif /* AWS_COMMON_FILE_H */

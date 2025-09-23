@@ -23,6 +23,20 @@ static int s_test_cpu_count_at_least_works_superficially_fn(struct aws_allocator
 
 AWS_TEST_CASE(test_cpu_count_at_least_works_superficially, s_test_cpu_count_at_least_works_superficially_fn)
 
+static int s_test_page_size_at_least_works_superficially_fn(struct aws_allocator *allocator, void *ctx) {
+    (void)allocator;
+    (void)ctx;
+
+    size_t page_size = aws_system_info_page_size();
+    ASSERT_TRUE(page_size > 0);
+    /* Page size should be a power of 2 */
+    ASSERT_TRUE((page_size & (page_size - 1)) == 0);
+
+    return 0;
+}
+
+AWS_TEST_CASE(test_page_size_at_least_works_superficially, s_test_page_size_at_least_works_superficially_fn)
+
 #if defined(_WIN32)
 #    include <io.h>
 #    define DIRSEP "\\"
@@ -166,3 +180,22 @@ static int s_test_sanity_check_numa_discovery(struct aws_allocator *allocator, v
 }
 
 AWS_TEST_CASE(test_sanity_check_numa_discovery, s_test_sanity_check_numa_discovery)
+
+static int s_test_sanity_check_environment_loader(struct aws_allocator *allocator, void *ctx) {
+    (void)ctx;
+
+    aws_common_library_init(allocator);
+    struct aws_system_environment *env = aws_system_environment_load(allocator);
+    ASSERT_NOT_NULL(env);
+    struct aws_byte_cursor virt_vendor = aws_system_environment_get_virtualization_vendor(env);
+    ASSERT_TRUE(aws_byte_cursor_is_valid(&virt_vendor));
+    struct aws_byte_cursor virt_product = aws_system_environment_get_virtualization_product_name(env);
+    ASSERT_TRUE(aws_byte_cursor_is_valid(&virt_product));
+
+    aws_system_environment_release(env);
+
+    aws_common_library_clean_up();
+    return 0;
+}
+
+AWS_TEST_CASE(test_sanity_check_environment_loader, s_test_sanity_check_environment_loader)
