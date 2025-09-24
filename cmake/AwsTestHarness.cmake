@@ -10,6 +10,10 @@ option(ENABLE_NET_TESTS "Run tests requiring an internet connection." ON)
 define_property(GLOBAL PROPERTY AWS_TEST_CASES BRIEF_DOCS "Test Cases" FULL_DOCS "Test Cases")
 set(AWS_TEST_CASES "" CACHE INTERNAL "Test cases valid for this configuration")
 
+# The return value for the skipped test cases. Refer to the return code defined in aws_test_harness.h:
+# #define SKIP (103)
+set(SKIP_RETURN_CODE_VALUE 103)
+
 # Registers a test case by name (the first argument to the AWS_TEST_CASE macro in aws_test_harness.h)
 macro(add_test_case name)
     list(APPEND TEST_CASES "${name}")
@@ -35,9 +39,9 @@ function(generate_test_driver driver_exe_name)
     add_executable(${driver_exe_name} ${CMAKE_CURRENT_BINARY_DIR}/test_runner.c ${TESTS})
     aws_set_common_properties(${driver_exe_name} NO_WEXTRA NO_PEDANTIC)
 
-     # Some versions of CMake (3.9-3.11) generate a test_runner.c file with
-     # a strncpy() call that triggers the "stringop-overflow" warning in GCC 8.1+
-     # This warning doesn't exist until GCC 7 though, so test for it before disabling.
+    # Some versions of CMake (3.9-3.11) generate a test_runner.c file with
+    # a strncpy() call that triggers the "stringop-overflow" warning in GCC 8.1+
+    # This warning doesn't exist until GCC 7 though, so test for it before disabling.
     if (NOT MSVC)
         check_c_compiler_flag(-Wno-stringop-overflow HAS_WNO_STRINGOP_OVERFLOW)
         if (HAS_WNO_STRINGOP_OVERFLOW)
@@ -49,22 +53,25 @@ function(generate_test_driver driver_exe_name)
 
     target_link_libraries(${driver_exe_name} PRIVATE ${PROJECT_NAME})
 
-    set_target_properties(${driver_exe_name} PROPERTIES LINKER_LANGUAGE C C_STANDARD 99)
-    if (MSVC)
-        if(STATIC_CRT)
-            target_compile_options(${driver_exe_name} PRIVATE "/MT$<$<CONFIG:Debug>:d>")
-        else()
-            target_compile_options(${driver_exe_name} PRIVATE "/MD$<$<CONFIG:Debug>:d>")
-        endif()
-    endif()
+    set_target_properties(${driver_exe_name} PROPERTIES
+        LINKER_LANGUAGE C
+        C_STANDARD 99
+        # Our ASSERT(...) macros rely on (widely supported) ##__VA_ARGS__ extension
+        C_EXTENSIONS ON
+    )
+
     target_compile_definitions(${driver_exe_name} PRIVATE AWS_UNSTABLE_TESTING_API=1)
     target_include_directories(${driver_exe_name} PRIVATE ${CMAKE_CURRENT_LIST_DIR})
 
+    # Export symbols so that backtraces are more likely to show function names.
+    set_target_properties(${driver_exe_name} PROPERTIES ENABLE_EXPORTS ON)
+
     foreach(name IN LISTS TEST_CASES)
         add_test(${name} ${driver_exe_name} "${name}")
+        set_tests_properties("${name}" PROPERTIES SKIP_RETURN_CODE ${SKIP_RETURN_CODE_VALUE})
     endforeach()
 
-    # Clear test cases in case another driver needsto be generated
+    # Clear test cases in case another driver needs to be generated
     unset(TEST_CASES PARENT_SCOPE)
 endfunction()
 
@@ -74,9 +81,13 @@ function(generate_cpp_test_driver driver_exe_name)
     add_executable(${driver_exe_name} ${CMAKE_CURRENT_BINARY_DIR}/test_runner.cpp ${TESTS})
     target_link_libraries(${driver_exe_name} PRIVATE ${PROJECT_NAME})
 
-    set_target_properties(${driver_exe_name} PROPERTIES LINKER_LANGUAGE CXX)
+    set_target_properties(${driver_exe_name} PROPERTIES
+        LINKER_LANGUAGE CXX
+        # Our ASSERT(...) macros rely on (widely supported) ##__VA_ARGS__ extension
+        CXX_EXTENSIONS ON
+    )
     if (MSVC)
-        if(STATIC_CRT)
+        if(AWS_STATIC_MSVC_RUNTIME_LIBRARY OR STATIC_CRT)
             target_compile_options(${driver_exe_name} PRIVATE "/MT$<$<CONFIG:Debug>:d>")
         else()
             target_compile_options(${driver_exe_name} PRIVATE "/MD$<$<CONFIG:Debug>:d>")
@@ -87,8 +98,9 @@ function(generate_cpp_test_driver driver_exe_name)
 
     foreach(name IN LISTS TEST_CASES)
         add_test(${name} ${driver_exe_name} "${name}")
+        set_tests_properties("${name}" PROPERTIES SKIP_RETURN_CODE ${SKIP_RETURN_CODE_VALUE})
     endforeach()
 
-    # Clear test cases in case another driver needsto be generated
+    # Clear test cases in case another driver needs to be generated
     unset(TEST_CASES PARENT_SCOPE)
 endfunction()
