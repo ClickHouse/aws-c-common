@@ -4,7 +4,7 @@
  */
 
 #if !defined(__MACH__)
-#    define _GNU_SOURCE
+#    define _GNU_SOURCE /* NOLINT(bugprone-reserved-identifier) */
 #endif
 
 #include <aws/common/clock.h>
@@ -23,9 +23,11 @@
 #include <time.h>
 #include <unistd.h>
 
-#if defined(__FreeBSD__) || defined(__NETBSD__)
+#if defined(__FreeBSD__) || defined(__NetBSD__)
 #    include <pthread_np.h>
 typedef cpuset_t cpu_set_t;
+#elif defined(__OpenBSD__)
+#    include <pthread_np.h>
 #endif
 
 #if !defined(AWS_AFFINITY_METHOD)
@@ -128,6 +130,8 @@ static void s_set_thread_name(pthread_t thread_id, const char *name) {
     pthread_setname_np(name);
 #elif defined(AWS_PTHREAD_SETNAME_TAKES_2ARGS)
     pthread_setname_np(thread_id, name);
+#elif defined(AWS_PTHREAD_SET_NAME_TAKES_2ARGS)
+    pthread_set_name_np(thread_id, name);
 #elif defined(AWS_PTHREAD_SETNAME_TAKES_3ARGS)
     pthread_setname_np(thread_id, name, NULL);
 #else
@@ -271,6 +275,25 @@ int aws_thread_launch(
             if (attr_return) {
                 goto cleanup;
             }
+        } else if (!options->stack_size) {
+            /**
+             * On some systems, the default stack size is too low (128KB on musl at the time of writing this), which can
+             * cause stack overflow when the dependency chain is long. Increase the stack size to at
+             * least 1MB, which is the default on Windows.
+             */
+            size_t min_stack_size = (size_t)1 * 1024 * 1024;
+            size_t current_stack_size;
+            attr_return = pthread_attr_getstacksize(attributes_ptr, &current_stack_size);
+            if (attr_return) {
+                goto cleanup;
+            }
+
+            if (current_stack_size < min_stack_size) {
+                attr_return = pthread_attr_setstacksize(attributes_ptr, min_stack_size);
+                if (attr_return) {
+                    goto cleanup;
+                }
+            }
         }
 
 /* AFAIK you can't set thread affinity on apple platforms, and it doesn't really matter since all memory
@@ -292,9 +315,9 @@ int aws_thread_launch(
             attr_return = pthread_attr_setaffinity_np(attributes_ptr, sizeof(cpuset), &cpuset);
 
             if (attr_return) {
-                AWS_LOGF_ERROR(
+                AWS_LOGF_WARN(
                     AWS_LS_COMMON_THREAD,
-                    "id=%p: pthread_attr_setaffinity_np() failed with %d.",
+                    "id=%p: pthread_attr_setaffinity_np() failed with %d. Continuing without cpu affinity",
                     (void *)thread,
                     attr_return);
                 goto cleanup;
@@ -378,7 +401,20 @@ cleanup:
 
     if (attr_return) {
         s_thread_wrapper_destroy(wrapper);
-
+        if (options && options->cpu_id >= 0) {
+            /*
+             * `pthread_create` can fail with an `EINVAL` error or `EDEADLK` on freebasd if the `cpu_id` is
+             * restricted/invalid. Since the pinning to a particular `cpu_id` is supposed to be best-effort, try to
+             * launch a thread again without pinning to a specific cpu_id.
+             */
+            AWS_LOGF_INFO(
+                AWS_LS_COMMON_THREAD,
+                "id=%p: Attempting to launch the thread again without pinning to a cpu_id",
+                (void *)thread);
+            struct aws_thread_options new_options = *options;
+            new_options.cpu_id = -1;
+            return aws_thread_launch(thread, func, arg, &new_options);
+        }
         switch (attr_return) {
             case EINVAL:
                 return aws_raise_error(AWS_ERROR_THREAD_INVALID_SETTINGS);
@@ -460,4 +496,33 @@ int aws_thread_current_at_exit(aws_thread_atexit_fn *callback, void *user_data) 
     cb->next = tl_wrapper->atexit;
     tl_wrapper->atexit = cb;
     return AWS_OP_SUCCESS;
+}
+
+int aws_thread_current_name(struct aws_allocator *allocator, struct aws_string **out_name) {
+    return aws_thread_name(allocator, aws_thread_current_thread_id(), out_name);
+}
+
+#define THREAD_NAME_BUFFER_SIZE 256
+int aws_thread_name(struct aws_allocator *allocator, aws_thread_id_t thread_id, struct aws_string **out_name) {
+    *out_name = NULL;
+#if defined(AWS_PTHREAD_GETNAME_TAKES_2ARGS) || defined(AWS_PTHREAD_GETNAME_TAKES_3ARGS) ||                            \
+    defined(AWS_PTHREAD_GET_NAME_TAKES_2_ARGS)
+    char name[THREAD_NAME_BUFFER_SIZE] = {0};
+#    ifdef AWS_PTHREAD_GETNAME_TAKES_3ARGS
+    if (pthread_getname_np(thread_id, name, THREAD_NAME_BUFFER_SIZE)) {
+#    elif AWS_PTHREAD_GETNAME_TAKES_2ARGS
+    if (pthread_getname_np(thread_id, name)) {
+#    elif AWS_PTHREAD_GET_NAME_TAKES_2ARGS
+    if (pthread_get_name_np(thread_id, name)) {
+#    endif
+
+        return aws_raise_error(AWS_ERROR_SYS_CALL_FAILURE);
+    }
+
+    *out_name = aws_string_new_from_c_str(allocator, name);
+    return AWS_OP_SUCCESS;
+#else
+
+    return aws_raise_error(AWS_ERROR_PLATFORM_NOT_SUPPORTED);
+#endif
 }
