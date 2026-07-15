@@ -2,13 +2,14 @@
  * Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
  * SPDX-License-Identifier: Apache-2.0.
  */
+
+#include <aws/common/allocator.h>
 #include <aws/common/device_random.h>
 #include <aws/common/file.h>
 #include <aws/common/string.h>
+#include <aws/common/system_info.h>
 
 #include <aws/testing/aws_test_harness.h>
-
-#include <fcntl.h>
 
 static int s_aws_fopen_test_helper(char *file_path, char *content) {
     char read_result[100];
@@ -542,3 +543,498 @@ static int s_test_byte_buf_init_from_file(struct aws_allocator *allocator, void 
 }
 
 AWS_TEST_CASE(test_byte_buf_init_from_file, s_test_byte_buf_init_from_file)
+
+struct aws_file_path_read_from_offset_tester {
+    struct aws_allocator *alloc;
+    struct aws_allocator *aligned_allocator;
+    size_t page_size;
+    struct aws_string *file_path;
+    struct aws_byte_buf content;
+    size_t file_length;
+};
+
+static int s_file_path_read_from_offset_tester_init(
+    struct aws_file_path_read_from_offset_tester *tester,
+    struct aws_allocator *allocator,
+    char *file_path,
+    size_t file_length) {
+
+    tester->alloc = allocator;
+    tester->page_size = aws_system_info_page_size();
+    tester->aligned_allocator = aws_explicit_aligned_allocator_new(tester->page_size);
+    if (!tester->aligned_allocator) {
+        return AWS_OP_ERR;
+    }
+    tester->file_path = aws_string_new_from_c_str(tester->aligned_allocator, file_path);
+    tester->file_length = file_length;
+    struct aws_byte_cursor content = aws_byte_cursor_from_c_str("0123456789abcdef");
+    aws_byte_buf_init_copy_from_cursor(&tester->content, allocator, content);
+
+    FILE *file = aws_fopen(file_path, "w+");
+    ASSERT_NOT_NULL(file);
+
+    /* Write to the file, repeating the content until the file length is met */
+    size_t bytes_written = 0;
+    while (bytes_written < file_length) {
+        size_t bytes_to_write = aws_min_size(content.len, file_length - bytes_written);
+        size_t written = fwrite(content.ptr, 1, bytes_to_write, file);
+        if (written != bytes_to_write) {
+            fclose(file);
+            return AWS_OP_ERR;
+        }
+        bytes_written += written;
+    }
+
+    fclose(file);
+    return AWS_OP_SUCCESS;
+}
+
+static void s_file_path_read_from_offset_tester_cleanup(struct aws_file_path_read_from_offset_tester *tester) {
+    aws_byte_buf_clean_up(&tester->content);
+    remove(aws_string_c_str(tester->file_path));
+    aws_string_destroy(tester->file_path);
+    aws_explicit_aligned_allocator_destroy(tester->aligned_allocator);
+}
+
+static int s_test_file_path_read_from_offset_direct_io(struct aws_allocator *allocator, void *ctx) {
+    (void)ctx;
+
+#if defined(AWS_OS_LINUX)
+    struct aws_file_path_read_from_offset_tester tester;
+    char file_path[] = "test_file_path_read_from_offset_direct_io.txt";
+
+    /* Create a file that's at least 2 pages in size to test offset reading */
+    size_t page_size = aws_system_info_page_size();
+    size_t file_size = page_size * 2;
+
+    ASSERT_SUCCESS(s_file_path_read_from_offset_tester_init(&tester, allocator, file_path, file_size));
+
+    /* Test 1: Read the first page and check the result matches expectation */
+    struct aws_byte_buf output_buf;
+    ASSERT_SUCCESS(aws_byte_buf_init(&output_buf, tester.aligned_allocator, page_size));
+
+    size_t actual_read = 0;
+    ASSERT_SUCCESS(aws_file_path_read_from_offset_direct_io(tester.file_path, 0, page_size, &output_buf, &actual_read));
+
+    ASSERT_UINT_EQUALS(page_size, actual_read);
+    ASSERT_UINT_EQUALS(page_size, output_buf.len);
+
+    /* Verify the content matches what we expect from the first page */
+    struct aws_byte_cursor expected_content = aws_byte_cursor_from_c_str("0123456789abcdef");
+    for (size_t i = 0; i < page_size; i++) {
+        size_t pattern_index = i % expected_content.len;
+        ASSERT_UINT_EQUALS(expected_content.ptr[pattern_index], output_buf.buffer[i]);
+    }
+
+    aws_byte_buf_clean_up(&output_buf);
+
+    /* Test 2: Set offset to the page size, and read the next page */
+    ASSERT_SUCCESS(aws_byte_buf_init(&output_buf, tester.aligned_allocator, page_size));
+
+    actual_read = 0;
+    ASSERT_SUCCESS(
+        aws_file_path_read_from_offset_direct_io(tester.file_path, page_size, page_size, &output_buf, &actual_read));
+
+    ASSERT_UINT_EQUALS(page_size, actual_read);
+    ASSERT_UINT_EQUALS(page_size, output_buf.len);
+
+    /* Verify the content matches what we expect from the second page */
+    for (size_t i = 0; i < page_size; i++) {
+        size_t file_position = page_size + i;
+        size_t pattern_index = file_position % expected_content.len;
+        ASSERT_UINT_EQUALS(expected_content.ptr[pattern_index], output_buf.buffer[i]);
+    }
+
+    aws_byte_buf_clean_up(&output_buf);
+
+    /* Test 3: Test unaligned offset - should fail with AWS_ERROR_INVALID_ARGUMENT */
+    ASSERT_SUCCESS(aws_byte_buf_init(&output_buf, tester.aligned_allocator, page_size));
+
+    size_t unaligned_offset = 1; /* Not aligned to page boundary */
+    ASSERT_FAILS(aws_file_path_read_from_offset_direct_io(
+        tester.file_path, unaligned_offset, page_size, &output_buf, &actual_read));
+    ASSERT_UINT_EQUALS(AWS_ERROR_INVALID_ARGUMENT, aws_last_error());
+
+    aws_byte_buf_clean_up(&output_buf);
+
+    /* Test 4: Test unaligned size - should fail with AWS_ERROR_INVALID_ARGUMENT */
+    ASSERT_SUCCESS(aws_byte_buf_init(&output_buf, tester.aligned_allocator, page_size));
+
+    size_t unaligned_size = page_size - 1; /* Not aligned to page boundary */
+    ASSERT_FAILS(
+        aws_file_path_read_from_offset_direct_io(tester.file_path, 0, unaligned_size, &output_buf, &actual_read));
+    ASSERT_UINT_EQUALS(AWS_ERROR_INVALID_ARGUMENT, aws_last_error());
+
+    aws_byte_buf_clean_up(&output_buf);
+
+    /* Cleanup */
+    s_file_path_read_from_offset_tester_cleanup(&tester);
+#else
+    struct aws_string *file_path =
+        aws_string_new_from_c_str(allocator, "test_file_path_read_from_offset_direct_io.txt");
+    ASSERT_FAILS(aws_file_path_read_from_offset_direct_io(file_path, 0, 10, NULL, NULL));
+    ASSERT_UINT_EQUALS(AWS_ERROR_UNSUPPORTED_OPERATION, aws_last_error());
+    aws_string_destroy(file_path);
+#endif
+
+    return AWS_OP_SUCCESS;
+}
+
+AWS_TEST_CASE(test_file_path_read_from_offset_direct_io, s_test_file_path_read_from_offset_direct_io)
+
+static int s_test_file_path_read_from_offset(struct aws_allocator *allocator, void *ctx) {
+    (void)ctx;
+
+    struct aws_file_path_read_from_offset_tester tester;
+    char file_path[] = "test_file_path_read_from_offset.txt";
+
+    /* Create a test file with known content */
+    size_t file_size = 1024; /* 1KB file for testing */
+
+    ASSERT_SUCCESS(s_file_path_read_from_offset_tester_init(&tester, allocator, file_path, file_size));
+
+    /* Test 1: Read from the beginning of the file */
+    struct aws_byte_buf output_buf;
+    ASSERT_SUCCESS(aws_byte_buf_init(&output_buf, allocator, 100));
+
+    size_t actual_read = 0;
+    ASSERT_SUCCESS(aws_file_path_read_from_offset(tester.file_path, 0, 100, &output_buf, &actual_read));
+
+    ASSERT_UINT_EQUALS(100, actual_read);
+    ASSERT_UINT_EQUALS(100, output_buf.len);
+
+    /* Verify the content matches what we expect from the beginning */
+    struct aws_byte_cursor expected_content = aws_byte_cursor_from_c_str("0123456789abcdef");
+    for (size_t i = 0; i < 100; i++) {
+        size_t pattern_index = i % expected_content.len;
+        ASSERT_UINT_EQUALS(expected_content.ptr[pattern_index], output_buf.buffer[i]);
+    }
+
+    aws_byte_buf_clean_up(&output_buf);
+
+    /* Test 2: Read from an offset in the middle of the file */
+    ASSERT_SUCCESS(aws_byte_buf_init(&output_buf, allocator, 50));
+
+    size_t offset = 200;
+    actual_read = 0;
+    ASSERT_SUCCESS(aws_file_path_read_from_offset(tester.file_path, offset, 50, &output_buf, &actual_read));
+
+    ASSERT_UINT_EQUALS(50, actual_read);
+    ASSERT_UINT_EQUALS(50, output_buf.len);
+
+    /* Verify the content matches what we expect from the offset position */
+    for (size_t i = 0; i < 50; i++) {
+        size_t file_position = offset + i;
+        size_t pattern_index = file_position % expected_content.len;
+        ASSERT_UINT_EQUALS(expected_content.ptr[pattern_index], output_buf.buffer[i]);
+    }
+
+    aws_byte_buf_clean_up(&output_buf);
+
+    /* Test 3: Read near the end of the file */
+    ASSERT_SUCCESS(aws_byte_buf_init(&output_buf, allocator, 100));
+
+    offset = file_size - 50; /* Read the last 50 bytes */
+    actual_read = 0;
+    ASSERT_SUCCESS(aws_file_path_read_from_offset(tester.file_path, offset, 100, &output_buf, &actual_read));
+
+    ASSERT_UINT_EQUALS(50, actual_read); /* Should only read 50 bytes since that's all that's left */
+    ASSERT_UINT_EQUALS(50, output_buf.len);
+
+    /* Verify the content matches what we expect from near the end */
+    for (size_t i = 0; i < 50; i++) {
+        size_t file_position = offset + i;
+        size_t pattern_index = file_position % expected_content.len;
+        ASSERT_UINT_EQUALS(expected_content.ptr[pattern_index], output_buf.buffer[i]);
+    }
+
+    aws_byte_buf_clean_up(&output_buf);
+
+    /* Test 4: Try to read beyond the end of the file */
+    ASSERT_SUCCESS(aws_byte_buf_init(&output_buf, allocator, 100));
+
+    offset = file_size + 10; /* Beyond the end of the file */
+    actual_read = 0;
+    ASSERT_SUCCESS(aws_file_path_read_from_offset(tester.file_path, offset, 100, &output_buf, &actual_read));
+
+    ASSERT_UINT_EQUALS(0, actual_read); /* Should read 0 bytes */
+    ASSERT_UINT_EQUALS(0, output_buf.len);
+
+    aws_byte_buf_clean_up(&output_buf);
+
+    /* Test 5: Read with unaligned offset and size (should work fine for regular read) */
+    ASSERT_SUCCESS(aws_byte_buf_init(&output_buf, allocator, 37));
+
+    offset = 13; /* Arbitrary unaligned offset */
+    actual_read = 0;
+    ASSERT_SUCCESS(aws_file_path_read_from_offset(tester.file_path, offset, 37, &output_buf, &actual_read));
+
+    ASSERT_UINT_EQUALS(37, actual_read);
+    ASSERT_UINT_EQUALS(37, output_buf.len);
+
+    /* Verify the content matches what we expect from the unaligned offset */
+    for (size_t i = 0; i < 37; i++) {
+        size_t file_position = offset + i;
+        size_t pattern_index = file_position % expected_content.len;
+        ASSERT_UINT_EQUALS(expected_content.ptr[pattern_index], output_buf.buffer[i]);
+    }
+
+    aws_byte_buf_clean_up(&output_buf);
+
+    /* Test 6: Test with zero-length read */
+    ASSERT_SUCCESS(aws_byte_buf_init(&output_buf, allocator, 0));
+
+    actual_read = 0;
+    ASSERT_SUCCESS(aws_file_path_read_from_offset(tester.file_path, 0, 0, &output_buf, &actual_read));
+
+    ASSERT_UINT_EQUALS(0, actual_read);
+    ASSERT_UINT_EQUALS(0, output_buf.len);
+
+    aws_byte_buf_clean_up(&output_buf);
+
+    /* Cleanup */
+    s_file_path_read_from_offset_tester_cleanup(&tester);
+
+    return AWS_OP_SUCCESS;
+}
+
+AWS_TEST_CASE(test_file_path_read_from_offset, s_test_file_path_read_from_offset)
+
+static int s_test_file_path_read_from_offset_direct_io_chunking(struct aws_allocator *allocator, void *ctx) {
+    (void)ctx;
+
+#if defined(AWS_OS_LINUX)
+    struct aws_file_path_read_from_offset_tester tester;
+    char file_path[] = "test_direct_io_chunking.txt";
+    /* Instead of creating a 2GiB file to test, we use the separate API that allows us to pass in the chunk size. */
+    size_t chunk_size = 8192;
+    size_t page_size = aws_system_info_page_size();
+    size_t file_size = chunk_size * 2 + page_size; /* Ensure it's larger than chunk size */
+
+    ASSERT_SUCCESS(s_file_path_read_from_offset_tester_init(&tester, allocator, file_path, file_size));
+
+    /* Test 1: Read exactly chunk_size bytes - should not trigger chunking */
+    struct aws_byte_buf output_buf;
+    ASSERT_SUCCESS(aws_byte_buf_init(&output_buf, tester.aligned_allocator, chunk_size));
+
+    size_t actual_read = 0;
+    ASSERT_SUCCESS(aws_file_path_read_from_offset_direct_io_with_chunk_size(
+        tester.file_path, 0, chunk_size, chunk_size, &output_buf, &actual_read));
+
+    ASSERT_UINT_EQUALS(chunk_size, actual_read);
+    ASSERT_UINT_EQUALS(chunk_size, output_buf.len);
+
+    /* Verify the content matches our expected pattern */
+    struct aws_byte_cursor expected_pattern = aws_byte_cursor_from_c_str("0123456789abcdef");
+    for (size_t i = 0; i < chunk_size; i++) {
+        size_t pattern_index = i % expected_pattern.len;
+        ASSERT_UINT_EQUALS(expected_pattern.ptr[pattern_index], output_buf.buffer[i]);
+    }
+
+    aws_byte_buf_clean_up(&output_buf);
+
+    /* Test 2: Read more than chunk_size bytes - should trigger chunking */
+    size_t large_read_size = chunk_size + page_size; /* Ensure it's page-aligned */
+    ASSERT_SUCCESS(aws_byte_buf_init(&output_buf, tester.aligned_allocator, large_read_size));
+
+    actual_read = 0;
+    ASSERT_SUCCESS(aws_file_path_read_from_offset_direct_io_with_chunk_size(
+        tester.file_path, 0, large_read_size, chunk_size, &output_buf, &actual_read));
+
+    ASSERT_UINT_EQUALS(large_read_size, actual_read);
+    ASSERT_UINT_EQUALS(large_read_size, output_buf.len);
+
+    /* Verify the content matches our expected pattern across the entire read */
+    for (size_t i = 0; i < large_read_size; i++) {
+        size_t pattern_index = i % expected_pattern.len;
+        ASSERT_UINT_EQUALS(expected_pattern.ptr[pattern_index], output_buf.buffer[i]);
+    }
+
+    aws_byte_buf_clean_up(&output_buf);
+
+    /* Test 3: Read much more than chunk_size - multiple chunks */
+    size_t very_large_read_size = file_size; /* Ensure it's page-aligned */
+
+    ASSERT_SUCCESS(aws_byte_buf_init(&output_buf, tester.aligned_allocator, very_large_read_size));
+
+    actual_read = 0;
+    ASSERT_SUCCESS(aws_file_path_read_from_offset_direct_io_with_chunk_size(
+        tester.file_path, 0, very_large_read_size, chunk_size, &output_buf, &actual_read));
+
+    ASSERT_UINT_EQUALS(very_large_read_size, actual_read);
+    ASSERT_UINT_EQUALS(very_large_read_size, output_buf.len);
+
+    /* Verify the content matches our expected pattern across the entire read */
+    for (size_t i = 0; i < very_large_read_size; i++) {
+        size_t pattern_index = i % expected_pattern.len;
+        ASSERT_UINT_EQUALS(expected_pattern.ptr[pattern_index], output_buf.buffer[i]);
+    }
+
+    aws_byte_buf_clean_up(&output_buf);
+
+    /* Cleanup */
+    s_file_path_read_from_offset_tester_cleanup(&tester);
+
+#else
+    /* On non-Linux platforms, the function should return AWS_ERROR_UNSUPPORTED_OPERATION */
+    struct aws_string *file_path = aws_string_new_from_c_str(allocator, "test_direct_io_chunking.txt");
+    struct aws_byte_buf dummy_buf;
+    aws_byte_buf_init(&dummy_buf, allocator, 1024);
+    size_t dummy_read = 0;
+
+    ASSERT_FAILS(aws_file_path_read_from_offset_direct_io(file_path, 0, 1024, &dummy_buf, &dummy_read));
+    ASSERT_UINT_EQUALS(AWS_ERROR_UNSUPPORTED_OPERATION, aws_last_error());
+
+    aws_byte_buf_clean_up(&dummy_buf);
+    aws_string_destroy(file_path);
+#endif
+
+    return AWS_OP_SUCCESS;
+}
+
+AWS_TEST_CASE(test_file_path_read_from_offset_direct_io_chunking, s_test_file_path_read_from_offset_direct_io_chunking)
+
+static int s_test_file_path_write_to_offset_direct_io(struct aws_allocator *allocator, void *ctx) {
+    (void)ctx;
+
+#if defined(AWS_OS_LINUX)
+    size_t page_size = aws_system_info_page_size();
+    struct aws_allocator *aligned_alloc = aws_explicit_aligned_allocator_new(page_size);
+    ASSERT_NOT_NULL(aligned_alloc);
+
+    char file_path_cstr[] = "test_file_path_write_to_offset_direct_io.txt";
+    struct aws_string *file_path = aws_string_new_from_c_str(allocator, file_path_cstr);
+
+    /* Create the file first (function requires it to exist) */
+    FILE *f = aws_fopen(file_path_cstr, "wb");
+    ASSERT_NOT_NULL(f);
+    fclose(f);
+
+    /* Test 1: Write 2 aligned pages of 'A' at offset 0 */
+    size_t two_pages = page_size * 2;
+    struct aws_byte_buf write_buf;
+    ASSERT_SUCCESS(aws_byte_buf_init(&write_buf, aligned_alloc, two_pages));
+    memset(write_buf.buffer, 'A', two_pages);
+    write_buf.len = two_pages;
+    struct aws_byte_cursor write_cursor = aws_byte_cursor_from_buf(&write_buf);
+    ASSERT_SUCCESS(aws_file_path_write_to_offset_direct_io(file_path, 0, write_cursor));
+
+    /* Read back and verify */
+    struct aws_byte_buf read_buf;
+    ASSERT_SUCCESS(aws_byte_buf_init(&read_buf, aligned_alloc, two_pages));
+    size_t actual_read = 0;
+    ASSERT_SUCCESS(aws_file_path_read_from_offset_direct_io(file_path, 0, two_pages, &read_buf, &actual_read));
+    ASSERT_UINT_EQUALS(two_pages, actual_read);
+    for (size_t i = 0; i < two_pages; i++) {
+        ASSERT_UINT_EQUALS('A', read_buf.buffer[i]);
+    }
+    aws_byte_buf_clean_up(&read_buf);
+
+    /* Test 2: Write 1 page of 'C' at page-aligned offset (second page) */
+    struct aws_byte_buf overwrite_buf;
+    ASSERT_SUCCESS(aws_byte_buf_init(&overwrite_buf, aligned_alloc, page_size));
+    memset(overwrite_buf.buffer, 'C', page_size);
+    overwrite_buf.len = page_size;
+    struct aws_byte_cursor overwrite_cursor = aws_byte_cursor_from_buf(&overwrite_buf);
+    ASSERT_SUCCESS(aws_file_path_write_to_offset_direct_io(file_path, (uint64_t)page_size, overwrite_cursor));
+
+    /* Read back and verify first page still 'A', second page now 'C' */
+    ASSERT_SUCCESS(aws_byte_buf_init(&read_buf, aligned_alloc, two_pages));
+    actual_read = 0;
+    ASSERT_SUCCESS(aws_file_path_read_from_offset_direct_io(file_path, 0, two_pages, &read_buf, &actual_read));
+    ASSERT_UINT_EQUALS(two_pages, actual_read);
+    for (size_t i = 0; i < page_size; i++) {
+        ASSERT_UINT_EQUALS('A', read_buf.buffer[i]);
+    }
+    for (size_t i = page_size; i < two_pages; i++) {
+        ASSERT_UINT_EQUALS('C', read_buf.buffer[i]);
+    }
+    aws_byte_buf_clean_up(&read_buf);
+    aws_byte_buf_clean_up(&overwrite_buf);
+
+    /* Test 3: Unaligned MUST fail */
+    struct aws_byte_buf unaligned_buf;
+    size_t unaligned_len = page_size + 37;
+    ASSERT_SUCCESS(aws_byte_buf_init(&unaligned_buf, aligned_alloc, unaligned_len));
+    memset(unaligned_buf.buffer, 'X', unaligned_len);
+    unaligned_buf.len = unaligned_len;
+    struct aws_byte_cursor unaligned_cursor = aws_byte_cursor_from_buf(&unaligned_buf);
+    ASSERT_FAILS(aws_file_path_write_to_offset_direct_io(file_path, 37, unaligned_cursor));
+    ASSERT_UINT_EQUALS(AWS_ERROR_INVALID_ARGUMENT, aws_last_error());
+    aws_byte_buf_clean_up(&unaligned_buf);
+
+    /* Test 4: File does not exist MUST fail */
+    struct aws_string *nonexistent = aws_string_new_from_c_str(allocator, "nonexistent_direct_io_file.txt");
+    struct aws_byte_cursor one_page_cursor = {.ptr = write_buf.buffer, .len = page_size};
+    ASSERT_FAILS(aws_file_path_write_to_offset_direct_io(nonexistent, 0, one_page_cursor));
+    aws_string_destroy(nonexistent);
+
+    /* Test 5: Mixed O_DIRECT + buffered writes at non-overlapping offsets, verify all data correct.
+     * Simulates the download pattern: O_DIRECT for aligned parts, buffered write for last part tail. */
+    remove(file_path_cstr);
+    f = aws_fopen(file_path_cstr, "wb");
+    ASSERT_NOT_NULL(f);
+    fclose(f);
+
+    /* Write 3 pages with O_DIRECT: page 0='D', page 1='E', page 2='F' */
+    memset(write_buf.buffer, 'D', page_size);
+    write_cursor = (struct aws_byte_cursor){.ptr = write_buf.buffer, .len = page_size};
+    ASSERT_SUCCESS(aws_file_path_write_to_offset_direct_io(file_path, 0, write_cursor));
+
+    memset(write_buf.buffer, 'E', page_size);
+    ASSERT_SUCCESS(aws_file_path_write_to_offset_direct_io(file_path, (uint64_t)page_size, write_cursor));
+
+    memset(write_buf.buffer, 'F', page_size);
+    ASSERT_SUCCESS(aws_file_path_write_to_offset_direct_io(file_path, (uint64_t)(page_size * 2), write_cursor));
+
+    /* Write unaligned tail (37 bytes of 'G') at offset page_size*3 using buffered write */
+    size_t tail_len = 37;
+    uint8_t tail_data[37];
+    memset(tail_data, 'G', tail_len);
+    FILE *tail_file = aws_fopen(file_path_cstr, "r+b");
+    ASSERT_NOT_NULL(tail_file);
+    ASSERT_TRUE(fseek(tail_file, (long)(page_size * 3), SEEK_SET) == 0);
+    size_t written = fwrite(tail_data, 1, tail_len, tail_file);
+    ASSERT_INT_EQUALS((int)tail_len, (int)written);
+    fclose(tail_file);
+
+    /* Read entire file back and verify all regions */
+    size_t total_size = page_size * 3 + tail_len;
+    FILE *verify_file = aws_fopen(file_path_cstr, "rb");
+    ASSERT_NOT_NULL(verify_file);
+    uint8_t *verify_buf = aws_mem_calloc(allocator, 1, total_size);
+    ASSERT_UINT_EQUALS(total_size, fread(verify_buf, 1, total_size, verify_file));
+    fclose(verify_file);
+
+    for (size_t i = 0; i < page_size; i++) {
+        ASSERT_UINT_EQUALS('D', verify_buf[i]);
+    }
+    for (size_t i = page_size; i < page_size * 2; i++) {
+        ASSERT_UINT_EQUALS('E', verify_buf[i]);
+    }
+    for (size_t i = page_size * 2; i < page_size * 3; i++) {
+        ASSERT_UINT_EQUALS('F', verify_buf[i]);
+    }
+    for (size_t i = page_size * 3; i < total_size; i++) {
+        ASSERT_UINT_EQUALS('G', verify_buf[i]);
+    }
+    aws_mem_release(allocator, verify_buf);
+
+    /* Cleanup */
+    aws_byte_buf_clean_up(&write_buf);
+    remove(file_path_cstr);
+    aws_string_destroy(file_path);
+    aws_explicit_aligned_allocator_destroy(aligned_alloc);
+#else
+    (void)allocator;
+    struct aws_string *file_path = aws_string_new_from_c_str(allocator, "dummy.txt");
+    struct aws_byte_cursor empty = {.ptr = NULL, .len = 0};
+    ASSERT_FAILS(aws_file_path_write_to_offset_direct_io(file_path, 0, empty));
+    ASSERT_UINT_EQUALS(AWS_ERROR_UNSUPPORTED_OPERATION, aws_last_error());
+    aws_string_destroy(file_path);
+#endif
+
+    return AWS_OP_SUCCESS;
+}
+
+AWS_TEST_CASE(test_file_path_write_to_offset_direct_io, s_test_file_path_write_to_offset_direct_io)
